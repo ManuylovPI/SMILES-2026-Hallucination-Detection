@@ -13,124 +13,153 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+try:
+    from xgboost import XGBClassifier
+    _HAS_XGB = True
+except ImportError:
+    _HAS_XGB = False
+
+HIDDEN_DIM = 3584
+GEOM_DIM = 25
+META_DIM = 14
+
+LOGREG_C = 0.01
+GB_PARAMS = dict(n_estimators=100, max_depth=3, learning_rate=0.1,
+                 random_state=42)
+XGB_PARAMS = dict(
+    n_estimators=200, max_depth=4, learning_rate=0.05,
+    subsample=0.8, colsample_bytree=0.8,
+    random_state=42, eval_metric='logloss', verbosity=0,
+    use_label_encoder=False,
+)
 
 
 class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
-
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
-    """
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
-
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
-
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
-
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
-    # ------------------------------------------------------------------
+        self._lr_pipe: Pipeline | None = None
+        self._xgb: XGBClassifier | None = None
+        self._fallback_used = False
+        self._threshold: float = 0.5
+        self._centroid_truthful: np.ndarray | None = None
+        self._centroid_hallucinated: np.ndarray | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
+        raise NotImplementedError(
+            "HallucinationProbe uses sklearn classifiers, "
+            "not torch forward. Use .predict_proba() instead."
+        )
 
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
+    def _sanitize(self, X: np.ndarray) -> np.ndarray:
+        X = np.asarray(X, dtype=np.float32)
+        X = np.nan_to_num(X, nan=0.0, posinf=1e4, neginf=-1e4)
+        X = np.clip(X, -1e4, 1e4)
+        return X
 
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
-            )
-        return self._net(x).squeeze(-1)
+    def _compute_centroid_distances(self, X: np.ndarray) -> np.ndarray:
+
+        if self._centroid_truthful is None or self._centroid_hallucinated is None:
+            return np.zeros((X.shape[0], 4), dtype=np.float32)
+
+        layer24 = X[:, 3*896:4*896]
+
+        ct = self._centroid_truthful
+        ch = self._centroid_hallucinated
+
+        dist_features = np.zeros((X.shape[0], 4), dtype=np.float32)
+        eps = 1e-9
+        for i in range(X.shape[0]):
+            vec = layer24[i]
+            dist_features[i, 0] = np.linalg.norm(vec - ct)
+            dist_features[i, 1] = np.linalg.norm(vec - ch)
+            dist_features[i, 2] = np.dot(vec, ct) / (
+                np.linalg.norm(vec) * np.linalg.norm(ct) + eps)
+            dist_features[i, 3] = np.dot(vec, ch) / (
+                np.linalg.norm(vec) * np.linalg.norm(ch) + eps)
+
+        dist_features = np.nan_to_num(dist_features, nan=0.0,
+                                       posinf=1e4, neginf=-1e4)
+        return np.clip(dist_features, -1e4, 1e4)
+
+    def _augment_features(self, X: np.ndarray) -> np.ndarray:
+        dist = self._compute_centroid_distances(X)
+        return np.concatenate([X, dist], axis=1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
+        X = self._sanitize(X)
+        y = np.asarray(y).astype(np.int64)
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
+        layer24 = X[:, 3*896:4*896]
+        if (y == 0).any():
+            self._centroid_truthful = layer24[y == 0].mean(axis=0)
+        else:
+            self._centroid_truthful = layer24.mean(axis=0)
 
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
+        if (y == 1).any():
+            self._centroid_hallucinated = layer24[y == 1].mean(axis=0)
+        else:
+            self._centroid_hallucinated = layer24.mean(axis=0)
 
-        Returns:
-            ``self`` (for method chaining).
-        """
-        X_scaled = self._scaler.fit_transform(X)
+        X_aug = self._augment_features(X)
 
-        self._build_network(X_scaled.shape[1])
+        self._lr_pipe = Pipeline([
+            ('scaler', StandardScaler()),
+            ('logreg', LogisticRegression(
+                C=LOGREG_C, max_iter=2000,
+                class_weight='balanced', random_state=42)),
+        ])
+        self._lr_pipe.fit(X_aug, y)
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        n_pos = int((y == 1).sum())
+        n_neg = int((y == 0).sum())
+        scale_pos_weight = n_neg / max(n_pos, 1)
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        if _HAS_XGB:
+            xgb_params = {**XGB_PARAMS, 'scale_pos_weight': scale_pos_weight}
+            xgb_params.pop('use_label_encoder', None)
+            self._xgb = XGBClassifier(**xgb_params)
+            self._xgb.fit(X_aug, y)
+            self._fallback_used = False
+        else:
+            from sklearn.ensemble import GradientBoostingClassifier
+            self._xgb = GradientBoostingClassifier(**GB_PARAMS)
+            self._xgb.fit(X_aug, y)
+            self._fallback_used = True
 
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
         return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+
+        X = self._sanitize(X)
+        X_aug = self._augment_features(X)
+
+        proba_lr = self._lr_pipe.predict_proba(X_aug)[:, 1]
+        proba_xgb = self._xgb.predict_proba(X_aug)[:, 1]
+
+        proba_pos = (proba_lr + proba_xgb) / 2.0
+
+        return np.stack([1.0 - proba_pos, proba_pos], axis=1)
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba_pos = self.predict_proba(X)[:, 1]
+        return (proba_pos >= self._threshold).astype(int)
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
         probs = self.predict_proba(X_val)[:, 1]
+        y_val = np.asarray(y_val).astype(int)
 
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
+        candidates = np.unique(np.concatenate([
+            probs,
+            np.linspace(0.0, 1.0, 101),
+        ]))
 
         best_threshold = 0.5
         best_f1 = -1.0
@@ -143,36 +172,3 @@ class HallucinationProbe(nn.Module):
 
         self._threshold = best_threshold
         return self
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
-        return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
-
-    def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
-        """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-

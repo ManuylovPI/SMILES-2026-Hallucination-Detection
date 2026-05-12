@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 
 
 def split_data(
@@ -28,43 +28,36 @@ def split_data(
     val_size: float = 0.15,
     random_state: int = 42,
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
-    """Split dataset indices into train, validation, and test subsets.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    n_folds = 5
+    y = np.asarray(y).astype(int)
+    indices = np.arange(len(y))
 
-    Args:
-        y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
-        df:           Optional full DataFrame (same row order as ``y``).
-                      Required for group-aware splits.
-        test_size:    Fraction of samples reserved for the held-out test set.
-        val_size:     Fraction of samples reserved for validation.
-        random_state: Random seed for reproducible splits.
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True,
+                          random_state=random_state)
 
-    Returns:
-        A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
+    splits: list[tuple[np.ndarray, np.ndarray | None, np.ndarray]] = []
 
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
-    """
+    for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(indices, y)):
 
-    idx = np.arange(len(y))
+        val_relative = val_size / (1.0 - 0.20)
+        n_val = max(1, int(round(len(train_val_idx) * val_relative)))
 
-    idx_train_val, idx_test = train_test_split(
-        idx,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y,
-    )
-    relative_val = val_size / (1.0 - test_size)
-    idx_train, idx_val = train_test_split(
-        idx_train_val,
-        test_size=relative_val,
-        random_state=random_state,
-        stratify=y[idx_train_val],
-    )
-    return [(idx_train, idx_val, idx_test)]
+        rng = np.random.default_rng(random_state + fold_idx)
 
+        labels_pool = y[train_val_idx]
+        val_indices_in_pool = []
+        for cls in np.unique(labels_pool):
+            cls_mask = (labels_pool == cls)
+            cls_pool = train_val_idx[cls_mask]
+            n_cls_val = max(1, int(round(n_val * cls_mask.mean())))
+            n_cls_val = min(n_cls_val, len(cls_pool) - 1)
+            chosen = rng.choice(cls_pool, size=n_cls_val, replace=False)
+            val_indices_in_pool.append(chosen)
+
+        val_idx = np.concatenate(val_indices_in_pool)
+        train_idx = np.array([i for i in train_val_idx if i not in set(val_idx)])
+
+        splits.append((train_idx, val_idx, test_idx))
+
+    return splits

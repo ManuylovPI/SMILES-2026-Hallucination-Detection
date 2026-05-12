@@ -16,77 +16,148 @@ single entry point called from the notebook.
 """
 
 from __future__ import annotations
+from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import torch
 
+SELECTED_LAYERS = [13, 22, 18, 24]
+POOLINGS = ['max', 'max', 'max', 'last']
+WINDOW_SIZE = 64
+
+_meta_cache = {
+    'rows': None,
+    'response_to_idx': None,
+    'idx_counter': 0,
+}
+
+
+def _load_dataset_for_meta(data_path: str | Path) -> None:
+    df = pd.read_csv(data_path)
+    rows = list(zip(df['prompt'].astype(str), df['response'].astype(str)))
+    _meta_cache['rows'] = rows
+    _meta_cache['response_to_idx'] = {
+        (str(p), str(r)): i for i, (p, r) in enumerate(rows)
+    }
+    _meta_cache['idx_counter'] = 0
+
+
+def _ensure_dataset_loaded() -> None:
+    if _meta_cache['rows'] is not None:
+        return
+    rows = []
+    for path in ['./data/dataset.csv', './data/test.csv']:
+        if Path(path).exists():
+            df = pd.read_csv(path)
+            for _, row in df.iterrows():
+                rows.append((str(row['prompt']), str(row['response'])))
+    _meta_cache['rows'] = rows
+    _meta_cache['response_to_idx'] = {
+        (p, r): i for i, (p, r) in enumerate(rows)
+    }
+
+
+def _compute_meta_features_for_text(prompt: str, response: str) -> np.ndarray:
+    response_clean = response.replace('<|endoftext|>', '').strip()
+    words = response_clean.split()
+    response_lower = response_clean.lower()
+
+    features = [
+        len(response_clean),
+        len(words),
+        np.log1p(len(response_clean)),
+        len(prompt),
+        len(response_clean) / (len(prompt) + 1),
+        float('unable to answer' in response_lower),
+        float(any(w in response_lower
+                  for w in ['cannot', "can't", 'unable', 'not enough'])),
+        response_clean.count('.') + response_clean.count('!')
+            + response_clean.count('?'),
+        response_clean.count(','),
+        sum(c.isdigit() for c in response_clean),
+        sum(c.isupper() for c in response_clean),
+        np.mean([len(w) for w in words]) if words else 0,
+        len(set(response_lower.split())),
+        len(set(response_lower.split())) / (len(words) + 1),
+    ]
+    return np.array(features, dtype=np.float32)
+
+def _pool_tokens(
+    layer_tokens: torch.Tensor,
+    pooling: str,
+) -> torch.Tensor:
+    if pooling == 'last':
+        return layer_tokens[-1]
+    elif pooling == 'mean':
+        return layer_tokens.mean(dim=0)
+    elif pooling == 'max':
+        return layer_tokens.max(dim=0).values
+    elif pooling == 'first':
+        return layer_tokens[0]
+    else:
+        raise ValueError(f"Unknown pooling: {pooling}")
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Convert per-token hidden states into a single feature vector.
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    real_len = real_positions.numel()
 
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-                        Layer index 0 is the token embedding; index -1 is the
-                        final transformer layer.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+    if real_len == 0:
+        hidden_dim = hidden_states.size(-1)
+        return torch.zeros(hidden_dim * len(SELECTED_LAYERS))
 
-    Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` or
-        ``(k * hidden_dim,)`` if multiple layers are concatenated.
+    if real_len > WINDOW_SIZE:
+        window_positions = real_positions[-WINDOW_SIZE:]
+    else:
+        window_positions = real_positions
 
-    Student task:
-        Replace or extend the skeleton below with alternative layer selection,
-        token pooling (mean, max, weighted), or multi-layer fusion strategies.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    parts: list[torch.Tensor] = []
+    for layer_idx, pooling in zip(SELECTED_LAYERS, POOLINGS):
+        layer = hidden_states[layer_idx]
+        windowed = layer[window_positions]
+        pooled = _pool_tokens(windowed, pooling)
+        parts.append(pooled)
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
-
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
-
-    feature = layer[last_pos]          # (hidden_dim,)
-
-    return feature
-    # ------------------------------------------------------------------
+    return torch.cat(parts, dim=0)
 
 
 def extract_geometric_features(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Extract hand-crafted geometric / statistical features from hidden states.
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    if real_positions.numel() == 0:
+        n_layers = hidden_states.size(0)
+        geom_norms = torch.zeros(n_layers)
+    else:
+        last_pos = int(real_positions[-1].item())
+        n_layers = hidden_states.size(0)
+        geom_norms = torch.zeros(n_layers)
+        for l in range(n_layers):
+            vec = hidden_states[l, last_pos, :]
+            geom_norms[l] = torch.norm(vec).item()
 
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
-    returned tensor is concatenated with the output of ``aggregate``.
+    _ensure_dataset_loaded()
+    rows = _meta_cache['rows']
 
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
+    if rows and _meta_cache['idx_counter'] < len(rows):
+        prompt, response = rows[_meta_cache['idx_counter']]
+        meta = _compute_meta_features_for_text(prompt, response)
+        _meta_cache['idx_counter'] += 1
+    else:
+        meta = np.zeros(14, dtype=np.float32)
 
-    Returns:
-        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
-        must be the same for every sample.
+    meta_t = torch.from_numpy(meta).float()
 
-    Student task:
-        Replace the stub below.  Possible features: layer-wise activation
-        norms, inter-layer cosine similarity (representation drift), or
-        sequence length.
-    """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
+    combined = torch.cat([geom_norms, meta_t], dim=0)
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    combined = torch.nan_to_num(combined, nan=0.0, posinf=1e4, neginf=-1e4)
+    combined = torch.clamp(combined, min=-1e4, max=1e4)
+
+    return combined
 
 
 def aggregation_and_feature_extraction(
@@ -94,29 +165,11 @@ def aggregation_and_feature_extraction(
     attention_mask: torch.Tensor,
     use_geometric: bool = False,
 ) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
-
-    Main entry point called from ``solution.ipynb`` for each sample.
-    Concatenates the output of ``aggregate`` with that of
-    ``extract_geometric_features`` when ``use_geometric=True``.
-
-    Args:
-        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
-                        for a single sample.
-        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
-                        tokens and 0 for padding.
-        use_geometric:  Whether to append geometric features.  Controlled by
-                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
-
-    Returns:
-        A 1-D float tensor of shape ``(feature_dim,)`` where
-        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
-        concatenations).
-    """
-    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
-
-    if use_geometric:
-        geo_features = extract_geometric_features(hidden_states, attention_mask)
-        return torch.cat([agg_features, geo_features], dim=0)
-
-    return agg_features
+    agg_features = aggregate(hidden_states, attention_mask)
+    geo_features = extract_geometric_features(hidden_states, attention_mask)
+    
+    # Ensure both tensors are on the same device before concat
+    # (agg_features stays on the device of hidden_states, geo_features may be on CPU)
+    geo_features = geo_features.to(agg_features.device)
+    
+    return torch.cat([agg_features, geo_features], dim=0)
